@@ -12,6 +12,7 @@ import vulkan_hpp;
 #include <stdexcept>
 #include <cstdlib>
 #include <ranges>
+#include <map>
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -44,6 +45,8 @@ private:
 
     vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
 
+    vk::raii::PhysicalDevice physicalDevice = nullptr;
+
     void initWindow() {
         glfwInit();
 
@@ -51,6 +54,12 @@ private:
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+    }
+
+    void initVulkan() {
+        createInstance();
+        setupDebugMessenger();
+        pickPhysicalDevice();
     }
 
     void createInstance() {
@@ -62,16 +71,13 @@ private:
             .apiVersion = vk::ApiVersion14
         };
 
-        // Get the required extensions.
-        auto requiredExtensions = getRequiredInstanceExtensions();
-
         // get the required layers
         std::vector<char const*> requiredLayers;
-        if (enableValidationLayers)
-        {
+        if (enableValidationLayers) {
             requiredLayers.assign(validationLayers.begin(), validationLayers.end());
         }
-
+        
+        // check if the required layers a re supported by the Vulkan implimentation
         auto layerProperties = context.enumerateInstanceLayerProperties();
         auto unsupportedLayerIt = std::ranges::find_if(
             requiredLayers,
@@ -85,28 +91,30 @@ private:
             }
         );
 
+        if (unsupportedLayerIt != requiredLayers.end())
+        {
+            throw std::runtime_error("Required layer not supported: " + std::string(*unsupportedLayerIt));
+        }
+
+        // Get the required extensions.
+        auto requiredExtensions = getRequiredInstanceExtensions();
+
         // Check if the required extensions are supported by the Vulkan implementation.
         auto extensionProperties = context.enumerateInstanceExtensionProperties();
-        auto unsupportedPropertyIt =
-            std::ranges::find_if(
-                requiredExtensions,
-                [&extensionProperties](auto const &requiredExtension) {
-                    return std::ranges::none_of(
-                        extensionProperties,
-                        [requiredExtension](auto const &extensionProperty) {
-                            return strcmp(extensionProperty.extensionName, requiredExtension) == 0; 
-                        }
-                    );
-                }
+        auto unsupportedPropertyIt = std::ranges::find_if(
+            requiredExtensions,
+            [&extensionProperties](auto const &requiredExtension) {
+                return std::ranges::none_of(
+                    extensionProperties,
+                    [requiredExtension](auto const &extensionProperty) {
+                        return strcmp(extensionProperty.extensionName, requiredExtension) == 0; 
+                    }
+                );
+            }
         );
         if (unsupportedPropertyIt != requiredExtensions.end())
         {
             throw std::runtime_error("Required extension not supported: " + std::string(*unsupportedPropertyIt));
-        }
-
-        if (unsupportedLayerIt != requiredLayers.end())
-        {
-            throw std::runtime_error("Required layer not supported: " + std::string(*unsupportedLayerIt));
         }
 
         vk::InstanceCreateInfo createInfo{
@@ -117,14 +125,6 @@ private:
             .ppEnabledExtensionNames = requiredExtensions.data()};
 
         instance = vk::raii::Instance(context, createInfo);
-
-        auto extensions = context.enumerateInstanceExtensionProperties();
-        
-        std::cout << "available extensions:\n";
-
-        for (const auto& extension: extensions) {
-            std::cout << "\t" << extension.extensionName << "\n";
-        }
     }
 
     std::vector<const char*> getRequiredInstanceExtensions() {
@@ -162,8 +162,70 @@ private:
         debugMessenger = instance.createDebugUtilsMessengerEXT( debugUtilsMessengerCreateInfoEXT );
     }
 
-    void initVulkan() {
-        createInstance();
+    void pickPhysicalDevice() {
+        auto physicalDevices = instance.enumeratePhysicalDevices();
+
+        if (physicalDevices.empty()) {
+            throw std::runtime_error("failed to find GPUs with vulkan support");
+        }
+
+        std::multimap<int, vk::raii::PhysicalDevice> candidates;
+
+        for (auto pd : physicalDevices) {
+            auto deviceProperties = pd.getProperties();
+            auto deviceFeatures = pd.getFeatures();
+            uint32_t score = 0;
+
+            bool isDescreteDevice = deviceProperties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+
+            bool supportsVulkan1_3 = pd.getProperties().apiVersion >= vk::ApiVersion13;
+
+            auto queueFamilies = pd.getQueueFamilyProperties();
+            bool supportsGraphics = std::ranges::any_of(
+                queueFamilies,
+                [](auto const &qfp) {
+                    return !!(qfp.queueFlags & vk::QueueFlagBits::eGraphics);
+                }
+            );
+
+            std::vector<const char*> requiredDeviceExtensions = {
+                vk::KHRSwapchainExtensionName
+            };
+
+            auto availableDeviceExtensions = pd.enumerateDeviceExtensionProperties();
+            bool supportsAllRequiredExtensions = std::ranges::all_of(
+                requiredDeviceExtensions,
+                [&availableDeviceExtensions](auto const& requiredDeviceExtension) {
+                    return std::ranges::any_of(
+                        availableDeviceExtensions,
+                        [requiredDeviceExtension](auto const& availableDeviceExtension) {
+                            return strcmp(availableDeviceExtension.extensionName, requiredDeviceExtension) == 0;
+                        }
+                    );
+                }
+            );
+
+            auto features = pd.template getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+            bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering && features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+            
+            if (!supportsVulkan1_3 || !supportsGraphics || !supportsAllRequiredExtensions || !supportsRequiredFeatures) {
+                continue;
+            }
+
+            if (isDescreteDevice) {
+                score += 4000;
+            }
+
+            score += deviceProperties.limits.maxImageDimension2D;
+
+            candidates.insert(std::make_pair(score, pd));
+        }
+
+        if (!candidates.empty() && candidates.rbegin()->first > 0) {
+            physicalDevice = candidates.rbegin()->second;
+        } else {
+            throw std::runtime_error("failed to find suitable GPU");
+        }
     }
 
     void mainLoop() {
