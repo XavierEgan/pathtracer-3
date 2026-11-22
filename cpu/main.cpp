@@ -1,7 +1,7 @@
-#include <string.h>
 #include <glm/glm.hpp>
 #include <glm/ext/scalar_relational.hpp>
 #include <vector>
+#include <string>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb/stb_image_write.h>
@@ -9,21 +9,19 @@
 float EPSILON = 1e-4;
 
 struct Rng {
-    int s;
+    uint32_t s;
     float next() {
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
         return (s >> 8) * (1.0f / 16777216.0f);
     }
 };
 
-class Frame {
+struct Frame {
     char* data;
     int width;
     int height;
 
-    Frame(int x, int y) {
-        data = new char[x * y * 3];
-    }
+    Frame(int x, int y) : data(new char[x * y * 3]), width(x), height(y) {}
     ~Frame() {
         delete[] data;
     }
@@ -32,53 +30,34 @@ class Frame {
     Frame(Frame&&) = delete;
     Frame& operator=(Frame&&) = delete;
 
-    void write_pixel(int x, int y, glm::u8vec3& color) {
+    void write_pixel(int x, int y, glm::u8vec3 color) {
         data[(y * width + x) * 3] = color.r;
         data[(y * width + x) * 3 + 1] = color.g;
         data[(y * width + x) * 3 + 2] = color.b;
     }
+
+    void save_image(const std::string& path) const {
+        stbi_write_png(path.c_str(), width, height, 3, data, width * 3);
+    }
 };
 
-class SwapChain {
+struct SwapChain {
     Frame cur_frame;
-    Frame rendering_frame;
+    Frame next_frame;
+
+    SwapChain(int x, int y) : cur_frame(Frame(x, y)), next_frame(Frame(x, y)) {}
 };
 
-class Material {
+struct Material {
     glm::vec3 color;
     float roughness;
-};
-
-class Scene {
-    std::vector<glm::vec3> verts;
-    std::vector<int> indices;
-
-    void add_tri(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2) {
-        // winded v2 -> v1 -> v0
-        // CCW winding
-        add_vert(v0);
-        add_vert(v1);
-        add_vert(v2);
-        
-        add_index(verts.size() - 1);
-        add_index(verts.size() - 2);
-        add_index(verts.size() - 3);
-    }
-
-    void add_vert(const glm::vec3& v) {
-        verts.push_back(v);
-    }
-
-    void add_index(int i) {
-        indices.push_back(i);
-    }
 };
 
 struct Ray {
     glm::vec3 origin;
     glm::vec3 direction;
 
-    bool intersect(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2, float& t, glm::vec2& uv, glm::vec3& pos) {
+    bool intersect(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2, float& t, glm::vec2& uv, glm::vec3& pos) const {
         glm::vec3 edge1 = v1 - v0;
         glm::vec3 edge2 = v2 - v0;
 
@@ -102,11 +81,12 @@ struct Ray {
 
         if (v < -EPSILON || u + v - 1 > EPSILON) return false;
 
-        float t = inv_det * dot(edge2, s_cross_e1);
+        float tt = inv_det * dot(edge2, s_cross_e1);
 
-        if (t > EPSILON) {
+        if (tt > EPSILON) {
+            t = tt;
             uv = glm::vec2(u, v);
-            pos = origin + direction * t;
+            pos = origin + direction * tt;
             return true;
         }
 
@@ -114,7 +94,8 @@ struct Ray {
     }
 };
 
-class Camera {
+
+struct Camera {
     Ray center;
     glm::vec3 forward;
     glm::vec3 up;
@@ -142,6 +123,8 @@ class Camera {
         cam.right = glm::normalize(glm::cross(cam.forward, kinda_up));
         cam.up = glm::normalize(glm::cross(cam.right, cam.forward));
 
+        cam.pos = origin;
+
         cam.horizontal_pixels = horizontal_pixels;
         cam.vertical_pixels = vertical_pixels;
         cam.horizontal_fov = horizontal_fov;
@@ -155,10 +138,10 @@ class Camera {
         // imagine a plane 1 unit from camera in forward direction with our forward vector being normal to the plane
         // right and up are also right and up on the plane
         // pos is the origin
-        float pixel_size = 2.0f * tan(horizontal_fov * 0.5f) / horizontal_pixels;
+        float pixel_size = 2.0f * tan(glm::radians(horizontal_fov) * 0.5f) / horizontal_pixels;
         
         glm::vec3 top_left_pixel = forward + right * ((x - (horizontal_pixels / 2)) * pixel_size) + up * -((y - (vertical_pixels / 2.0f)) * pixel_size);
-        glm::vec3 rand_point_in_pixel = top_left_pixel + right * static_cast<float>(rand() / RAND_MAX) - up * static_cast<float>(rand() / RAND_MAX);
+        glm::vec3 rand_point_in_pixel = top_left_pixel + right * rng.next() * pixel_size - up * rng.next() * pixel_size;
         glm::vec3 dir = rand_point_in_pixel - pos;
         Ray ray = Ray();
         ray.origin = pos;
@@ -167,14 +150,121 @@ class Camera {
     }
 };
 
-glm::u8vec3 shader() {
+struct Scene {
+    std::vector<glm::vec3> verts;
+    std::vector<int> indices;
 
+    std::vector<Material> materials;
+    std::vector<int> mat_indices;
+
+    Camera camera;
+
+    void add_tri(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2) {
+        // winded v2 -> v1 -> v0
+        // CCW winding
+        verts.push_back(v0);
+        verts.push_back(v1);
+        verts.push_back(v2);
+        
+        indices.push_back(verts.size() - 1);
+        indices.push_back(verts.size() - 2);
+        indices.push_back(verts.size() - 3);
+    }
+
+    void add_tri(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2, Material material) {
+        // kinda jank since you cant share materials atm
+        add_tri(v0, v1, v2);
+        materials.push_back(material);
+        mat_indices.push_back(mat_indices.size());
+    }
+
+    void add_camera(Camera camera) {
+        this->camera = camera;
+    }
+};
+
+bool find_intersecting_triangle(const Scene& scene, const Ray& ray, float& t, glm::vec2& uv, glm::vec3& pos, int& tri_indx) {
+    float min_t = 9999999999.0f;
+    glm::vec2 min_uv;
+    glm::vec3 min_pos;
+    bool intersected = false;
+
+    for (auto tri{0uz}; tri < scene.indices.size() / 3; tri++) {
+        if (!ray.intersect(
+            scene.verts[scene.indices[tri * 3]],
+            scene.verts[scene.indices[tri * 3 + 1]],
+            scene.verts[scene.indices[tri * 3 + 2]],
+            t, uv, pos
+        )) continue;
+
+        intersected = true;
+
+        if (t < min_t) {
+            min_uv = uv;
+            min_pos = pos;
+            tri_indx = tri;
+            min_t = t;
+        }
+    }
+    uv = min_uv;
+    pos = min_pos;
+
+    return intersected;
 }
 
-void render(Frame& frame, Scene& scene) {
+glm::u8vec3 shader(int x, int y, const Frame& prev_frame, Scene& scene) {
+    glm::vec3 acc{0, 0, 0};
+    for (int r = 0; r < 100; r++) {
+        Ray ray = scene.camera.generate_camera_ray(x, y);
 
+        float t;
+        glm::vec2 uv;
+        glm::vec3 pos;
+        int tri_indx;
+
+        if (find_intersecting_triangle(scene, ray, t, uv, pos, tri_indx)) {
+            acc += scene.materials[scene.mat_indices[tri_indx]].color;
+        }
+    }
+
+    return acc * (1/100.0f);
+}
+
+void render(SwapChain& swap_chain, Scene& scene) {
+    // renders image to next_frame in the swapchain
+
+    for (int y = 0; y < scene.camera.vertical_pixels; y++) {
+        for (int x = 0; x < scene.camera.horizontal_pixels; x++) {
+            swap_chain.next_frame.write_pixel(x, y, shader(x, y, swap_chain.cur_frame, scene));
+        }
+    }
+}
+
+void test_scene_1() {
+    Scene scene = Scene();
+    scene.add_tri(
+        {0, 0, 0},
+        {0, .5, 0},
+        {0, 0, .5},
+        Material{{255, 0, 0}, 0}
+    );
+
+    scene.add_camera(Camera::look_at(
+        {0, 0, 0},
+        {-5, 0, 0},
+        {0, 1, 0},
+        854, 480,
+        90,
+        1
+    ));
+
+    SwapChain swap_chain = SwapChain(scene.camera.horizontal_pixels, scene.camera.vertical_pixels);
+
+    render(swap_chain, scene);
+
+    swap_chain.next_frame.save_image("test.png");
 }
 
 int main() {
-
+    test_scene_1();
 }
